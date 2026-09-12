@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import logging
 import sys
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from .checker import fetch_availability, load_notified, save_notified
 from .notifier import send_email
