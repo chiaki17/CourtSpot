@@ -17,8 +17,13 @@ URL = os.environ.get("COURT_URL", "https://court.ozzy.asia/court-demo")
 TZ = ZoneInfo("Asia/Bangkok")
 
 # ช่วงที่สนใจ (ชั่วโมงเริ่มต้นของ slot)
-WEEKDAY_HOURS = {19, 20}          # จ-ศ 19:00-21:00
-WEEKEND_HOURS = {16, 17, 18, 19, 20}  # ส-อา 16:00-21:00
+WEEKDAY_HOURS = [18, 19]               # → slot 19:00-20:00 และ 20:00-21:00
+WEEKEND_HOURS = list(range(15, 20))    # → slot 16:00-17:00 ถึง 20:00-21:00
+
+def is_target_hour(d: date, hour: int) -> bool:
+    if d.weekday() >= 5:  # Sat=5, Sun=6
+        return hour in WEEKEND_HOURS
+    return hour in WEEKDAY_HOURS
 
 # ชั่วโมงที่สนามเปิด (จากข้อมูลจริง)
 OPEN_HOURS = list(range(6, 22))  # 6..21
@@ -38,7 +43,7 @@ class Slot:
 
     @property
     def display(self) -> str:
-        return f"{self.date} {self.hour:02d}:00-{self.hour+1:02d}:00 | Court {self.court}"
+        return f"{self.date} {self.hour+1:02d}:00-{self.hour+2:02d}:00 @ {self.court}"
 
 
 def _today_bkk() -> date:
