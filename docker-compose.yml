@@ -1,0 +1,6 @@
+services:
+  checker:
+    build: .
+    env_file: .env
+    volumes:
+      - ./state:/app/state
