@@ -1,11 +1,11 @@
-"""Court availability checker via bookingMap API."""
+"""Court availability checker via bookingMap API (Optimized)."""
 from __future__ import annotations
 
 import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -15,23 +15,24 @@ logger = logging.getLogger(__name__)
 
 URL = os.environ.get("COURT_URL", "https://court.ozzy.asia/court-demo")
 TZ = ZoneInfo("Asia/Bangkok")
-
-# ช่วงที่สนใจ (ชั่วโมงเริ่มต้นของ slot)
-WEEKDAY_HOURS = [18, 19]               # → slot 19:00-20:00 และ 20:00-21:00
-WEEKEND_HOURS = list(range(15, 20))    # → slot 16:00-17:00 ถึง 20:00-21:00
-
-def is_target_hour(d: date, hour: int) -> bool:
-    if d.weekday() >= 5:  # Sat=5, Sun=6
-        return hour in WEEKEND_HOURS
-    return hour in WEEKDAY_HOURS
-
-# ชั่วโมงที่สนามเปิด (จากข้อมูลจริง)
-OPEN_HOURS = list(range(6, 22))  # 6..21
-
 STATE_FILE = os.environ.get("STATE_FILE", "state/notified.json")
 
+# ช่วงเวลาที่สนใจ (Tuple เพื่อ immutable & lookup เร็ว)
+WEEKDAY_TARGETS = (18, 19)              # 19:00-20:00 และ 20:00-21:00
+WEEKEND_TARGETS = (15, 16, 17, 18, 19)  # 16:00-17:00 ถึง 20:00-21:00
 
-@dataclass(frozen=True)
+# ใช้ requests.Session() ร่วมกันเพื่อ reuse connection pool (ลดเวลา handshake)
+_SESSION = requests.Session()
+_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (compatible; CourtChecker/1.0)",
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    "Origin": "https://court.ozzy.asia",
+    "Referer": URL,
+})
+
+
+@dataclass(frozen=True, slots=True)
 class Slot:
     court: str
     date: str   # YYYY-MM-DD
@@ -50,17 +51,7 @@ def _today_bkk() -> date:
     return datetime.now(TZ).date()
 
 
-def is_target_hour(d: date, hour: int) -> bool:
-    if d.weekday() >= 5:  # Sat=5 Sun=6
-        return hour in WEEKEND_HOURS
-    return hour in WEEKDAY_HOURS
-
-
 def _resolve_date(day_num: int, today: date) -> date | None:
-    """
-    แปลงเลขวัน (1-31) → date จริง
-    ลองเดือนปัจจุบันก่อน ถ้าวันนั้นผ่านไปแล้ว ลองเดือนถัดไป
-    """
     for month_offset in (0, 1):
         m = today.month + month_offset
         y = today.year
@@ -71,31 +62,17 @@ def _resolve_date(day_num: int, today: date) -> date | None:
             d = date(y, m, day_num)
         except ValueError:
             continue
-        # ยอมรับวันนี้และอนาคต (ไม่เอาอดีต)
         if d >= today:
             return d
     return None
 
 
 def fetch_booking_map() -> dict[str, Any]:
-    """
-    เรียก API — ลองหลายแบบของ POST body
-    (เว็บเป็น SPA ยิง POST กลับมาที่ path เดียวกัน)
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; CourtChecker/1.0)",
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "Origin": "https://court.ozzy.asia",
-        "Referer": URL,
-    }
-
-    # ลองทีละแบบ จนได้ bookingMap
+    # ลด timeout เป็น (connect=3.05, read=10) และใช้ session เดียวกัน
     attempts = [
-        ("POST json {}", lambda: requests.post(URL, json={}, headers=headers, timeout=30)),
-        ("POST empty", lambda: requests.post(URL, data=b"", headers=headers, timeout=30)),
-        ("POST no body", lambda: requests.post(URL, headers={k: v for k, v in headers.items() if k != "Content-Type"}, timeout=30)),
-        ("GET", lambda: requests.get(URL, headers=headers, timeout=30)),
+        ("POST json {}", lambda: _SESSION.post(URL, json={}, timeout=(3.05, 10))),
+        ("POST empty",   lambda: _SESSION.post(URL, data=b"", timeout=(3.05, 10))),
+        ("GET",          lambda: _SESSION.get(URL, timeout=(3.05, 10))),
     ]
 
     last_err: Exception | None = None
@@ -103,21 +80,11 @@ def fetch_booking_map() -> dict[str, Any]:
         try:
             r = fn()
             r.raise_for_status()
-            # บางที response เป็น HTML ปน — พยายาม parse JSON
-            try:
-                data = r.json()
-            except Exception:
-                # ถ้าเป็น text ที่มี JSON ฝัง
-                text = r.text.strip()
-                if text.startswith("{"):
-                    data = json.loads(text)
-                else:
-                    logger.warning("[%s] non-JSON status=%s len=%d", name, r.status_code, len(r.text))
-                    continue
+            # ใช้ r.content แทน r.text เพื่อหลีกเลี่ยง overhead ของ chardet
+            data = json.loads(r.content)
             if isinstance(data, dict) and "bookingMap" in data:
                 logger.info("API OK via %s — days=%s", name, list(data["bookingMap"].keys()))
                 return data["bookingMap"]
-            logger.warning("[%s] JSON but no bookingMap keys=%s", name, list(data)[:10] if isinstance(data, dict) else type(data))
         except Exception as e:
             last_err = e
             logger.warning("[%s] failed: %s", name, e)
@@ -126,10 +93,6 @@ def fetch_booking_map() -> dict[str, Any]:
 
 
 def parse_available_slots(booking_map: dict[str, Any]) -> list[Slot]:
-    """
-    bookingMap[day][court][hour] = true  → จองแล้ว
-    ชั่วโมงที่ไม่มี key หรือเป็น false     → ว่าง
-    """
     today = _today_bkk()
     available: list[Slot] = []
 
@@ -138,31 +101,26 @@ def parse_available_slots(booking_map: dict[str, Any]) -> list[Slot]:
             day_num = int(day_str)
         except ValueError:
             continue
+
         d = _resolve_date(day_num, today)
-        if d is None:
+        if d is None or not isinstance(courts, dict):
             continue
 
-        if not isinstance(courts, dict):
-            continue
+        # เลือกเฉพาะชั่วโมงเป้าหมาย และแปลงวันที่ครั้งเดียว
+        target_hours = WEEKEND_TARGETS if d.weekday() >= 5 else WEEKDAY_TARGETS
+        date_str = d.isoformat()
 
         for court_str, hours in courts.items():
             if not isinstance(hours, dict):
                 continue
-            # ชั่วโมงที่จองแล้ว
-            booked = {int(h) for h, v in hours.items() if str(v).lower() == "true" or v is True}
-            # ชั่วโมงที่อาจ false ชัดเจน
-            explicitly_free = {int(h) for h, v in hours.items() if v is False or str(v).lower() == "false"}
+            court_name = str(court_str)
 
-            for hour in OPEN_HOURS:
-                is_free = hour in explicitly_free or hour not in booked
-                # ถ้า hour อยู่ใน map เป็น true → ไม่ free
-                if hour in booked:
-                    is_free = False
-                if not is_free:
+            # Direct lookup เฉพาะ target hours ไม่ต้องสร้าง set หรือวนลูป 16 ชั่วโมง
+            for hour in target_hours:
+                val = hours.get(str(hour))
+                if val is True or val == "true" or val == "True":
                     continue
-                if not is_target_hour(d, hour):
-                    continue
-                available.append(Slot(court=str(court_str), date=d.isoformat(), hour=hour))
+                available.append(Slot(court=court_name, date=date_str, hour=hour))
 
     available.sort(key=lambda s: (s.date, s.hour, s.court))
     return available
@@ -171,13 +129,14 @@ def parse_available_slots(booking_map: dict[str, Any]) -> list[Slot]:
 def fetch_availability() -> list[Slot]:
     booking_map = fetch_booking_map()
     slots = parse_available_slots(booking_map)
-    logger.info("Matching available slots: %d", len(slots))
-    for s in slots:
-        logger.info("  FREE %s", s.display)
+    # รวบ Log ให้เหลือครั้งเดียว ลด stdout I/O overhead
+    if slots:
+        logger.info("Matching available slots (%d):\n%s", len(slots), "\n".join(f"  FREE {s.display}" for s in slots))
+    else:
+        logger.info("Matching available slots: 0")
     return slots
 
 
-# ---------- state กันแจ้งซ้ำ ----------
 def load_notified() -> set[str]:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -189,7 +148,7 @@ def load_notified() -> set[str]:
 def save_notified(keys: set[str]) -> None:
     os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
     today_str = _today_bkk().isoformat()
-    # เก็บเฉพาะอนาคต
-    keys = {k for k in keys if k.split("|")[0] >= today_str}
+    keys = {k for k in keys if k.split("|", 1)[0] >= today_str}
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(keys), f, indent=2, ensure_ascii=False)
+        # compact json ไม่ต้องเคาะ space
+        json.dump(sorted(keys), f, ensure_ascii=False, separators=(",", ":"))
